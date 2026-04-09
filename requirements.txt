@@ -1,0 +1,33 @@
+# Core dependencies
+gradio>=4.0.0
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-community>=0.0.10
+openai>=1.0.0
+
+# Vector Database
+chromadb>=0.4.22
+sentence-transformers>=2.2.2
+
+# Cache & Memory
+redis>=5.0.1
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Image Processing
+Pillow>=10.0.0
+
+# API Clients
+replicate>=0.24.0
+requests>=2.31.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+typing-extensions>=4.8.0
+
+# Optional: for better performance
+aiohttp>=3.9.0
+asyncio>=3.4.3
