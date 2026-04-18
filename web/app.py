@@ -2,17 +2,28 @@
 from agents.orchestrator_simple import MemArtOrchestrator
 from config import Config
 import os
+from pathlib import Path
 
 
 def create_interface():
-    orchestrator = MemArtOrchestrator()
+    # 按 session 隔离 orchestrator 实例
+    orchestrators = {}
 
-    def respond(message, history):
+    def get_orchestrator(session_id: str) -> MemArtOrchestrator:
+        """获取或创建 session 专属的 orchestrator"""
+        if session_id not in orchestrators:
+            orchestrators[session_id] = MemArtOrchestrator(session_id)
+            print(f"📝 新会话创建: {session_id[:8]}...")
+        return orchestrators[session_id]
+
+    def respond(message, history, request: gr.Request):
         if not message:
             return "", history
 
         if history is None:
             history = ""
+
+        orch = get_orchestrator(request.session_hash)
 
         import asyncio
         try:
@@ -25,7 +36,7 @@ def create_interface():
 
         async def get_response():
             nonlocal response_text
-            async for chunk in orchestrator.stream_with_strategy(message):
+            async for chunk in orch.stream_with_strategy(message):
                 response_text += chunk
 
         loop.run_until_complete(get_response())
@@ -34,31 +45,35 @@ def create_interface():
 
         return "", history
 
-    def set_strategy(strategy):
-        return orchestrator.switch_strategy(strategy)
+    def set_strategy(strategy, request: gr.Request):
+        orch = get_orchestrator(request.session_hash)
+        return orch.switch_strategy(strategy)
 
-    def set_mode(mode):
-        return orchestrator.switch_mode(mode)
+    def set_mode(mode, request: gr.Request):
+        orch = get_orchestrator(request.session_hash)
+        return orch.switch_mode(mode)
 
-    def toggle_image_gen(enabled):
-        return orchestrator.toggle_image_gen(enabled)
+    def toggle_image_gen(enabled, request: gr.Request):
+        orch = get_orchestrator(request.session_hash)
+        return orch.toggle_image_gen(enabled)
 
-    def switch_api(api_name):
-        success, message = orchestrator.switch_api(api_name)
+    def switch_api(api_name, request: gr.Request):
+        orch = get_orchestrator(request.session_hash)
+        success, message = orch.switch_api(api_name)
         return message
 
-    def switch_collaborative_pair(primary, secondary):
-        success, message = orchestrator.switch_collaborative_pair(primary, secondary)
+    def switch_collaborative_pair(primary, secondary, request: gr.Request):
+        orch = get_orchestrator(request.session_hash)
+        success, message = orch.switch_collaborative_pair(primary, secondary)
         return message
 
-    def upload_file(file):
+    def upload_file(file, request: gr.Request):
         if file is None:
             return "请选择文件", None
 
-        # 安全处理：只取文件名，丢弃路径
-        import os
-        from pathlib import Path
+        orch = get_orchestrator(request.session_hash)
 
+        # 安全处理：只取文件名，丢弃路径
         safe_filename = Path(file.name).name
 
         # 读取文件内容
@@ -70,13 +85,19 @@ def create_interface():
                 content = f.read()
 
         # 保存到文档处理器，使用安全文件名
-        result = orchestrator.process_document(safe_filename, content)
+        result = orch.process_document(safe_filename, content)
         return f"✅ {result}", None
 
-    # 获取当前 API 显示名称
-    def get_api_display():
+    # 获取当前 API 显示名称（需要 session 参数）
+    def get_api_display(request: gr.Request):
+        orch = get_orchestrator(request.session_hash)
         api_config = Config.get_current_api_config()
         return f"{api_config['icon']} {api_config['name']}"
+
+    # 获取当前模式显示
+    def get_mode_display(request: gr.Request):
+        orch = get_orchestrator(request.session_hash)
+        return orch.collaborative_mode
 
     # 创建界面
     with gr.Blocks(title="MemArt Agent") as demo:
@@ -90,8 +111,7 @@ def create_interface():
                 # 工作模式
                 with gr.Column(scale=1):
                     gr.Markdown("**工作模式**")
-                    mode_display = gr.Textbox(value=orchestrator.collaborative_mode, label="当前模式",
-                                              interactive=False)
+                    mode_display = gr.Textbox(value="single", label="当前模式", interactive=False)
                     with gr.Row():
                         single_mode_btn = gr.Button("🎯 单API模式", size="sm")
                         collab_mode_btn = gr.Button("🤝 协作模式", size="sm")
@@ -107,9 +127,8 @@ def create_interface():
         with gr.Group(visible=True) as single_api_group:
             gr.Markdown("### 🔌 单模式 API 选择")
             with gr.Row():
-                api_status = gr.Textbox(label="当前 API", value=get_api_display(), interactive=False, scale=2)
+                api_status = gr.Textbox(label="当前 API", value="", interactive=False, scale=2)
                 with gr.Column(scale=3):
-                    # 只显示 LLM API（不包括通义万相）
                     llm_apis = ["deepseek", "openai", "zhipu", "tongyi", "moonshot"]
                     for api_key in llm_apis:
                         if api_key in Config.SUPPORTED_APIS:
@@ -122,7 +141,6 @@ def create_interface():
             gr.Markdown("### 🤝 协作模式配置")
             gr.Markdown("主 API 负责理解分析，副 API 负责内容生成")
             with gr.Row():
-                # 获取 LLM API 列表
                 llm_choices = [(f"{info['icon']} {info['name']}", key)
                                for key, info in Config.SUPPORTED_APIS.items()
                                if key in ["deepseek", "openai", "zhipu", "tongyi", "moonshot"]]
@@ -141,7 +159,7 @@ def create_interface():
 
             collab_status = gr.Textbox(label="协作状态", interactive=False)
             apply_collab_btn.click(
-                lambda p, s: switch_collaborative_pair(p, s),
+                lambda p, s, r: switch_collaborative_pair(p, s, r),
                 [primary_select, secondary_select],
                 [collab_status]
             )
@@ -150,7 +168,7 @@ def create_interface():
         with gr.Group():
             gr.Markdown("### 🧠 推理策略")
             with gr.Row():
-                strategy_display = gr.Textbox(value="AUTO", label="当前策略", interactive=False, scale=1)
+                strategy_display = gr.Textbox(value="🤖 AUTO", label="当前策略", interactive=False, scale=1)
                 auto_btn = gr.Button("🤖 AUTO", variant="primary", scale=1)
                 react_btn = gr.Button("⚡ REACT", variant="secondary", scale=1)
                 cot_btn = gr.Button("💭 COT", variant="secondary", scale=1)
@@ -161,7 +179,7 @@ def create_interface():
             with gr.Row():
                 file_upload = gr.File(label="上传文档", file_types=[".txt", ".pdf", ".md", ".docx", ".csv"])
                 upload_status = gr.Textbox(label="上传状态", interactive=False, scale=2)
-            file_upload.upload(upload_file, [file_upload], [upload_status, file_upload])
+            file_upload.upload(upload_file, [file_upload], [upload_status])
             gr.Markdown("💡 提示：上传后系统会自动检索相关文档内容来增强回答")
 
         # 第六行：对话区域
@@ -183,31 +201,30 @@ def create_interface():
         def show_collab_mode():
             return gr.update(visible=False), gr.update(visible=True)
 
-        single_mode_btn.click(lambda: set_mode("single"), outputs=[mode_display])
+        single_mode_btn.click(lambda r: set_mode("single", r), outputs=[mode_display])
         single_mode_btn.click(show_single_mode, outputs=[single_api_group, collab_group])
 
-        collab_mode_btn.click(lambda: set_mode("collaborative"), outputs=[mode_display])
+        collab_mode_btn.click(lambda r: set_mode("collaborative", r), outputs=[mode_display])
         collab_mode_btn.click(show_collab_mode, outputs=[single_api_group, collab_group])
 
-        chain_mode_btn.click(lambda: set_mode("chain"), outputs=[mode_display])
+        chain_mode_btn.click(lambda r: set_mode("chain", r), outputs=[mode_display])
         chain_mode_btn.click(show_single_mode, outputs=[single_api_group, collab_group])
 
         # 文生图开关
-        def on_toggle_change(enabled):
-            status = orchestrator.toggle_image_gen(enabled)
-            return status
+        def on_toggle_change(enabled, r):
+            return toggle_image_gen(enabled, r)
 
         image_gen_toggle.change(on_toggle_change, [image_gen_toggle], [image_gen_status])
 
         # 策略事件
-        def set_strategy_wrapper(s):
-            result = set_strategy(s)
+        def set_strategy_wrapper(s, r):
+            result = set_strategy(s, r)
             display = {"auto": "🤖 AUTO", "react": "⚡ REACT", "cot": "💭 COT"}
             return display.get(s, "🤖 AUTO")
 
-        auto_btn.click(lambda: set_strategy_wrapper("auto"), outputs=[strategy_display])
-        react_btn.click(lambda: set_strategy_wrapper("react"), outputs=[strategy_display])
-        cot_btn.click(lambda: set_strategy_wrapper("cot"), outputs=[strategy_display])
+        auto_btn.click(lambda r: set_strategy_wrapper("auto", r), outputs=[strategy_display])
+        react_btn.click(lambda r: set_strategy_wrapper("react", r), outputs=[strategy_display])
+        cot_btn.click(lambda r: set_strategy_wrapper("cot", r), outputs=[strategy_display])
 
         # 发送事件
         send.click(respond, [msg, chatbot], [msg, chatbot])
