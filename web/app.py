@@ -55,18 +55,23 @@ def create_interface():
         if file is None:
             return "请选择文件", None
 
+        # 安全处理：只取文件名，丢弃路径
+        import os
+        from pathlib import Path
+
+        safe_filename = Path(file.name).name
+
         # 读取文件内容
         try:
             with open(file.name, 'r', encoding='utf-8') as f:
                 content = f.read()
         except UnicodeDecodeError:
-            # 尝试其他编码
             with open(file.name, 'r', encoding='gbk') as f:
                 content = f.read()
 
-        # 保存到文档处理器
-        result = orchestrator.process_document(file.name, content)
-        return result, None
+        # 保存到文档处理器，使用安全文件名
+        result = orchestrator.process_document(safe_filename, content)
+        return f"✅ {result}", None
 
     # 获取当前 API 显示名称
     def get_api_display():
