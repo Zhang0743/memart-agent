@@ -1,17 +1,21 @@
-﻿from config import Config
+﻿import threading
+from config import Config
 from openai import OpenAI
 from agents.vision_agent import VisionAgent
 from agents.document_processor import DocumentProcessor
 from agents.collaborative_client import CollaborativeClient
+from agents.cache import ResponseCache
+from tools import ToolRegistry, ImageGenTool, DocumentSearchTool
 
 
 class MemArtOrchestrator:
     def __init__(self, session_id: str = "default", default_strategy: str = "auto"):
+        self._lock = threading.RLock()
         self.session_id = session_id
         self.current_strategy = default_strategy
         self.current_api = Config.CURRENT_API
         self.collaborative_mode = getattr(Config, 'COLLABORATIVE_MODE', 'single')
-        self.enable_image_gen = True  # 文生图开关，默认开启
+        self.enable_image_gen = True
 
         # 初始化各个组件
         self.vision_agent = VisionAgent()
@@ -22,9 +26,26 @@ class MemArtOrchestrator:
         self.client = None
         self._init_client()
 
+        # 初始化缓存
+        self.cache = ResponseCache(
+            redis_host=getattr(Config, 'REDIS_HOST', 'localhost'),
+            redis_port=getattr(Config, 'REDIS_PORT', 6379),
+            ttl=3600
+        )
+
+        # 初始化工具系统
+        self.tool_registry = ToolRegistry()
+        self._init_tools()
+
         print(f"✅ MemArt Agent 初始化成功")
         print(f"   协作模式: {self.collaborative_mode}")
         print(f"   文生图: {'开启' if self.enable_image_gen else '关闭'}")
+        print(f"   已注册工具: {len(self.tool_registry.list_tools())} 个")
+
+    def _init_tools(self):
+        """初始化并注册所有工具"""
+        self.tool_registry.register(ImageGenTool(self.vision_agent))
+        self.tool_registry.register(DocumentSearchTool(self.doc_processor))
 
     def _init_client(self):
         """初始化单模式 API 客户端"""
@@ -49,40 +70,44 @@ class MemArtOrchestrator:
 
     def switch_strategy(self, strategy: str) -> str:
         """切换推理策略"""
-        valid = ["react", "cot", "auto"]
-        if strategy not in valid:
-            return f"无效策略，可选: {valid}"
-        self.current_strategy = strategy
-        return f"已切换到 {strategy.upper()}"
+        with self._lock:
+            valid = ["react", "cot", "auto"]
+            if strategy not in valid:
+                return f"无效策略，可选: {valid}"
+            self.current_strategy = strategy
+            return f"已切换到 {strategy.upper()}"
 
     def toggle_image_gen(self, enabled: bool) -> str:
         """切换文生图开关"""
-        self.enable_image_gen = enabled
-        return f"文生图功能已{'开启' if enabled else '关闭'}"
+        with self._lock:
+            self.enable_image_gen = enabled
+            return f"文生图功能已{'开启' if enabled else '关闭'}"
 
     def switch_mode(self, mode: str) -> str:
         """切换工作模式"""
-        valid_modes = ["single", "collaborative", "chain"]
-        if mode not in valid_modes:
-            return f"无效模式，可选: {valid_modes}"
-        self.collaborative_mode = mode
-        Config.COLLABORATIVE_MODE = mode
-        return f"已切换到 {mode} 模式"
+        with self._lock:
+            valid_modes = ["single", "collaborative", "chain"]
+            if mode not in valid_modes:
+                return f"无效模式，可选: {valid_modes}"
+            self.collaborative_mode = mode
+            Config.COLLABORATIVE_MODE = mode
+            return f"已切换到 {mode} 模式"
 
     def switch_api(self, api_name: str) -> tuple:
         """切换单模式 API"""
-        if api_name not in Config.SUPPORTED_APIS:
-            return False, f"不支持的 API: {api_name}"
+        with self._lock:
+            if api_name not in Config.SUPPORTED_APIS:
+                return False, f"不支持的 API: {api_name}"
 
-        Config.switch_api(api_name)
-        self.current_api = api_name
-        self._init_client()
+            Config.switch_api(api_name)
+            self.current_api = api_name
+            self._init_client()
 
-        api_config = Config.get_current_api_config()
-        if self.client:
-            return True, f"{api_config.get('icon', '')} 已切换到 {api_config.get('name', api_name)}"
-        else:
-            return False, f"{api_config.get('icon', '')} {api_config.get('name', api_name)} API Key 未配置"
+            api_config = Config.get_current_api_config()
+            if self.client:
+                return True, f"{api_config.get('icon', '')} 已切换到 {api_config.get('name', api_name)}"
+            else:
+                return False, f"{api_config.get('icon', '')} {api_config.get('name', api_name)} API Key 未配置"
 
     def switch_collaborative_pair(self, primary: str, secondary: str) -> tuple:
         """切换协作 API 对"""
@@ -120,11 +145,15 @@ class MemArtOrchestrator:
 
         yield f"**推理策略**: {display} | **文生图**: {'✅ 开启' if self.enable_image_gen else '❌ 关闭'}\n\n"
 
-        # 搜索相关文档
-        relevant_docs = self.doc_processor.search_documents(user_input)
+        # 搜索相关文档（使用带rerank的方法）
+        if hasattr(self.doc_processor, 'search_and_rerank'):
+            relevant_docs = self.doc_processor.search_and_rerank(user_input, k=3)
+        else:
+            relevant_docs = self.doc_processor.search_documents(user_input)[:3]
+
         if relevant_docs:
             yield f"**📄 相关文档片段**:\n"
-            for i, doc in enumerate(relevant_docs[:3]):
+            for i, doc in enumerate(relevant_docs):
                 yield f"{i + 1}. {doc[:200]}...\n"
             yield "\n"
 
@@ -160,7 +189,7 @@ class MemArtOrchestrator:
                 system_prompt += " 请使用 Chain of Thought 思维链方法，逐步推理后再给出答案。"
 
             if relevant_docs:
-                system_prompt += f"\n\n参考以下文档内容:\n{chr(10).join(relevant_docs[:3])}"
+                system_prompt += f"\n\n参考以下文档内容:\n{chr(10).join(relevant_docs)}"
 
             try:
                 api_config = Config.get_current_api_config()
