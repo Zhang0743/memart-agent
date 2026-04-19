@@ -58,25 +58,37 @@ class DocumentProcessor:
                 chunks.append(chunk)
         
         return chunks
-    
+
     def search_documents(self, query: str, k: int = 5) -> List[str]:
-        """搜索相关文档片段"""
+        """搜索相关文档片段（支持中文）"""
         if not query:
             return []
-        
+
         results = []
         query_lower = query.lower()
-        
+
         for doc_id, doc in self.documents.items():
             for chunk in doc['chunks']:
-                if query_lower in chunk.lower():
+                chunk_lower = chunk.lower()
+                # 对于中文：直接检查查询字符串是否部分包含于 chunk
+                # 或者检查 chunk 是否包含查询中长度>=2的子串
+                if query_lower in chunk_lower:
                     results.append(chunk)
                     if len(results) >= k:
-                        break
-            if len(results) >= k:
-                break
-        
-        return results
+                        return results[:k]
+                else:
+                    # 检查是否有部分重叠（任意长度≥2的子串匹配）
+                    matched = False
+                    for i in range(len(query_lower) - 1):
+                        sub = query_lower[i:i + 2]
+                        if sub in chunk_lower:
+                            matched = True
+                            break
+                    if matched:
+                        results.append(chunk)
+                        if len(results) >= k:
+                            return results[:k]
+        return results[:k]
     
     def get_all_documents(self) -> List[Dict]:
         """获取所有文档信息"""
@@ -93,3 +105,21 @@ class DocumentProcessor:
         """清空所有文档"""
         self.documents.clear()
         return "已清空所有文档"
+
+    def search_and_rerank(self, query: str, k: int = 3) -> List[str]:
+        candidates = self.search_documents(query, k=k * 3)  # 多取一些候选
+        if not candidates:
+            return []
+
+
+        query_words = set(query.lower().split())
+
+        def score(chunk: str) -> int:
+            chunk_lower = chunk.lower()
+            hit_score = sum(1 for word in query_words if word in chunk_lower)
+            if query.lower() in chunk_lower:
+                hit_score += 10
+            return hit_score
+
+        reranked = sorted(candidates, key=score, reverse=True)
+        return reranked[:k]
