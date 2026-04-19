@@ -6,6 +6,8 @@ from agents.document_processor import DocumentProcessor
 from agents.collaborative_client import CollaborativeClient
 from agents.cache import ResponseCache
 from tools import ToolRegistry, ImageGenTool, DocumentSearchTool
+from agents.planner import TaskPlanner
+from agents.executor import TaskExecutor
 
 
 class MemArtOrchestrator:
@@ -26,16 +28,20 @@ class MemArtOrchestrator:
         self.client = None
         self._init_client()
 
-        # 初始化缓存
+        # ========== 必须先初始化缓存和工具注册表 ==========
         self.cache = ResponseCache(
             redis_host=getattr(Config, 'REDIS_HOST', 'localhost'),
             redis_port=getattr(Config, 'REDIS_PORT', 6379),
             ttl=3600
         )
 
-        # 初始化工具系统
         self.tool_registry = ToolRegistry()
         self._init_tools()
+
+        # ========== 然后再初始化规划器和执行器 ==========
+        self.planner = TaskPlanner()
+        self.executor = TaskExecutor(self.doc_processor, self.tool_registry, self.cache)
+        self.enable_task_planning = True
 
         print(f"✅ MemArt Agent 初始化成功")
         print(f"   协作模式: {self.collaborative_mode}")
@@ -69,7 +75,6 @@ class MemArtOrchestrator:
         return f"{api_config.get('icon', '')} {api_config.get('name', 'Unknown')} ({api_config.get('model', 'unknown')})"
 
     def switch_strategy(self, strategy: str) -> str:
-        """切换推理策略"""
         with self._lock:
             valid = ["react", "cot", "auto"]
             if strategy not in valid:
@@ -78,13 +83,11 @@ class MemArtOrchestrator:
             return f"已切换到 {strategy.upper()}"
 
     def toggle_image_gen(self, enabled: bool) -> str:
-        """切换文生图开关"""
         with self._lock:
             self.enable_image_gen = enabled
             return f"文生图功能已{'开启' if enabled else '关闭'}"
 
     def switch_mode(self, mode: str) -> str:
-        """切换工作模式"""
         with self._lock:
             valid_modes = ["single", "collaborative", "chain"]
             if mode not in valid_modes:
@@ -94,15 +97,12 @@ class MemArtOrchestrator:
             return f"已切换到 {mode} 模式"
 
     def switch_api(self, api_name: str) -> tuple:
-        """切换单模式 API"""
         with self._lock:
             if api_name not in Config.SUPPORTED_APIS:
                 return False, f"不支持的 API: {api_name}"
-
             Config.switch_api(api_name)
             self.current_api = api_name
             self._init_client()
-
             api_config = Config.get_current_api_config()
             if self.client:
                 return True, f"{api_config.get('icon', '')} 已切换到 {api_config.get('name', api_name)}"
@@ -110,19 +110,15 @@ class MemArtOrchestrator:
                 return False, f"{api_config.get('icon', '')} {api_config.get('name', api_name)} API Key 未配置"
 
     def switch_collaborative_pair(self, primary: str, secondary: str) -> tuple:
-        """切换协作 API 对"""
         return self.collab_client.switch_collaborative_pair(primary, secondary)
 
     def process_document(self, file_path: str, content: str) -> str:
-        """处理上传的文档"""
         return self.doc_processor.save_document(file_path, content)
 
     def search_documents(self, query: str):
-        """搜索文档"""
         return self.doc_processor.search_documents(query)
 
     def _is_image_request(self, text: str) -> bool:
-        """判断是否请求生成图片"""
         if not self.enable_image_gen:
             return False
         keywords = ["生成", "图片", "画", "绘制", "创建", "制作", "给我", "一张", "幅"]
@@ -130,11 +126,9 @@ class MemArtOrchestrator:
         return any(kw in text for kw in keywords) and any(kw in text for kw in image_keywords)
 
     async def stream_with_strategy(self, user_input: str, strategy: str = None):
-        """流式处理用户输入"""
         strategy = strategy or self.current_strategy
         display = {"react": "⚡ REACT", "cot": "💭 COT", "auto": "🤖 AUTO"}.get(strategy, strategy)
 
-        # 显示当前状态
         if self.collaborative_mode == "single":
             api_config = Config.get_current_api_config()
             yield f"**模式**: 单API模式 | **API**: {api_config.get('icon', '')} {api_config.get('name', 'Unknown')}\n"
@@ -145,7 +139,16 @@ class MemArtOrchestrator:
 
         yield f"**推理策略**: {display} | **文生图**: {'✅ 开启' if self.enable_image_gen else '❌ 关闭'}\n\n"
 
-        # 搜索相关文档（使用带rerank的方法）
+        # 任务规划模式
+        if self.enable_task_planning and self._is_complex_query(user_input):
+            yield "🧠 **任务规划模式** (检测到复杂请求，正在拆解...)\n"
+            available_tools = [t["name"] for t in self.tool_registry.list_tools()]
+            plan = self.planner.plan(user_input, available_tools)
+            async for output in self.executor.execute_plan(plan, user_input):
+                yield output
+            return
+
+        # 文档检索
         if hasattr(self.doc_processor, 'search_and_rerank'):
             relevant_docs = self.doc_processor.search_and_rerank(user_input, k=3)
         else:
@@ -157,20 +160,18 @@ class MemArtOrchestrator:
                 yield f"{i + 1}. {doc[:200]}...\n"
             yield "\n"
 
-        # 检查是否是图片生成请求
+        # 图片生成
         if self._is_image_request(user_input):
             yield "🎨 正在生成图片...\n\n"
-            image_prompt = user_input.replace("生成", "").replace("给我", "").replace("一张", "").replace("幅",
-                                                                                                          "").strip()
+            image_prompt = user_input.replace("生成", "").replace("给我", "").replace("一张", "").replace("幅", "").strip()
             image_url = self.vision_agent.generate_image(image_prompt)
-
             if image_url.startswith("http"):
                 yield f"✅ 图片已生成！\n\n![生成的图片]({image_url})\n\n**描述**: {image_prompt}"
             else:
                 yield f"✅ 图片已生成！\n\n本地路径: `{image_url}`\n\n**描述**: {image_prompt}"
             return
 
-        # 根据模式处理对话
+        # 对话模式
         if self.collaborative_mode == "collaborative":
             async for chunk in self.collab_client.collaborative_chat(user_input, strategy):
                 yield chunk
@@ -178,7 +179,6 @@ class MemArtOrchestrator:
             result = await self.collab_client.chain_chat(user_input)
             yield result
         else:
-            # 单模式
             if not self.client:
                 api_config = Config.get_current_api_config()
                 yield f"❌ {api_config.get('name', 'API')} API 未配置\n\n请在 .env 文件中设置相应的 API Key"
@@ -205,3 +205,7 @@ class MemArtOrchestrator:
                 yield response.choices[0].message.content
             except Exception as e:
                 yield f"API 调用失败: {str(e)}"
+
+    def _is_complex_query(self, text: str) -> bool:
+        complex_keywords = ["比较", "对比", "先", "然后", "再", "最后", "步骤", "如何", "分析", "区别"]
+        return len(text) > 20 and any(kw in text for kw in complex_keywords)
